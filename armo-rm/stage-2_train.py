@@ -1,16 +1,16 @@
 import os
-import torch
-import numpy as np
-from safetensors.torch import load_file
 from argparse import ArgumentParser
-from tqdm.auto import tqdm
-from scipy.stats import spearmanr
-import pandas as pd
 from glob import glob
-from torch import nn
-import torch.nn.functional as F
-from sklearn.model_selection import train_test_split
+
 import datasets
+import numpy as np
+import pandas as pd
+import torch
+from mixing_functions import GatingNetwork
+from safetensors.torch import load_file
+from scipy.stats import spearmanr
+from sklearn.model_selection import train_test_split
+from tqdm.auto import tqdm
 
 # Enable TF32 for improved performance on Ampere GPUs
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -38,47 +38,6 @@ attributes = [
     "code-instruction-following",
     "code-readability",
 ]
-
-
-class GatingNetwork(nn.Module):
-    """
-    Gating Network: A simple MLP with softmax output and temperature scaling
-    This network learns to combine multiple reward objectives based on the input context
-    """
-
-    def __init__(
-        self,
-        in_features: int,
-        out_features: int,
-        bias: bool = True,
-        temperature: float = 10,
-        logit_scale: float = 1.0,
-        hidden_dim: int = 1024,
-        n_hidden: int = 3,
-        dropout: float = 0.0,
-    ):
-        super().__init__()
-        self.temperature = temperature
-        self.logit_scale = nn.Parameter(torch.ones(1) * logit_scale)
-        self.dropout_prob = dropout
-        layers = []
-        for _ in range(n_hidden):
-            layers.append(nn.Linear(in_features, hidden_dim))
-            in_features = hidden_dim
-        layers.append(nn.Linear(in_features, out_features, bias=bias))
-        self.layers = nn.ModuleList(layers)
-
-    def forward(self, x: torch.FloatTensor) -> torch.FloatTensor:
-        # Apply the linear layers with ReLU and dropout
-        for i, layer in enumerate(self.layers):
-            x = layer(x)
-            if i < len(self.layers) - 1:
-                x = F.relu(x)
-                if self.dropout_prob > 0:
-                    x = F.dropout(x, p=self.dropout_prob, training=self.training)
-        # Apply softmax with temperature scaling
-        x = F.softmax(x / self.temperature, dim=1)
-        return x * self.logit_scale[0]
 
 
 def find_proper_verbosity_penalties(cluster_V, verbosity_dim=4, corr_threshold=0.028):
@@ -314,7 +273,7 @@ parser.add_argument(
     default="RLHFlow/ArmoRM-Multi-Objective-Data-v0.1",
 )
 parser.add_argument(
-    "--preference_dataset", type=str, default="RLHFlow/pair_data_v2_80K_wsafety"
+    "--preference_dataset", type=str, default="RLHFlow/UltraFeedback-preference-standard"
 )
 parser.add_argument(
     "--reference_dataset",
@@ -339,7 +298,6 @@ parser.add_argument("--model_family", type=str, default="llama3", help="Model fa
 parser.add_argument(
     "--eval_reward_bench", action="store_true", help="Evaluate on RewardBench"
 )
-parser.add_argument("--logit_scale", type=float, default=1)
 parser.add_argument("--temperature", type=float, default=10)
 parser.add_argument("--n_hidden", type=int, default=3)
 parser.add_argument("--hidden_size", type=int, default=1024)
@@ -421,7 +379,6 @@ gating_network = GatingNetwork(
     regression_layer.shape[0],
     n_hidden=args.n_hidden,
     hidden_dim=args.hidden_size,
-    logit_scale=args.logit_scale,
     temperature=args.temperature,
     dropout=args.dropout,
 ).to(device)
@@ -444,7 +401,7 @@ for step in tqdm(range(args.n_steps)):
     Z_batch = Z_train[idx]
 
     # Forward pass
-    gating_weights = gating_network(X_batch)
+    gating_weights = gating_network.gating_weights(X_batch)
     pred = torch.sum(Z_batch @ regression_layer.T * gating_weights, dim=-1)
 
     # Compute loss
@@ -462,7 +419,7 @@ for step in tqdm(range(args.n_steps)):
 print("Evaluating model...")
 gating_network.eval()
 with torch.no_grad():
-    gating_weights_val = gating_network(X_val)
+    gating_weights_val = gating_network.gating_weights(X_val)
     pred_val = torch.sum(Z_val @ regression_layer.T * gating_weights_val, dim=-1)
     acc_val = ((pred_val[:, 0] - pred_val[:, 1]) > 0).float().mean()
     print(f"Validation accuracy: {acc_val.item():.4f}")
@@ -479,7 +436,7 @@ if args.eval_reward_bench:
         args.reward_bench_embedding_path, device=device
     )
     with torch.no_grad():
-        gating_weights_rb = gating_network(reward_bench_prompt_embeddings)
+        gating_weights_rb = gating_network.gating_weights(reward_bench_prompt_embeddings)
         pred_rb = torch.sum(
             reward_bench_embeddings @ regression_layer.T * gating_weights_rb, dim=-1
         )
